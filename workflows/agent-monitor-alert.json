@@ -1,0 +1,124 @@
+{
+  "name": "Agent Monitor & Alert",
+  "nodes": [
+    {
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 15 }]
+        }
+      }
+    },
+    {
+      "id": "fetch-agent-metrics",
+      "name": "Fetch Agent Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "https://your-monitoring-api.com/api/metrics/agents",
+        "queryParameters": {
+          "parameters": [
+            { "name": "window_minutes", "value": "15" },
+            { "name": "agents", "value": "triage,extraction,summarisation" }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": { "name": "YOUR_CRM_API_KEY" }
+      },
+      "notes": "Replace with your actual monitoring endpoint — Datadog, Supabase, CloudWatch, etc."
+    },
+    {
+      "id": "evaluate-thresholds",
+      "name": "Evaluate Thresholds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "parameters": {
+        "jsCode": "const metrics = $input.first().json;\n\nconst THRESHOLDS = {\n  error_rate_pct: 5,       // alert if >5% of calls errored\n  p95_latency_ms: 8000,   // alert if p95 latency >8s\n  low_confidence_pct: 20, // alert if >20% of outputs <0.8 confidence\n  zero_calls: true        // alert if no calls in window (possible pipeline failure)\n};\n\nconst alerts = [];\n\nfor (const agent of metrics.agents) {\n  if (agent.total_calls === 0 && THRESHOLDS.zero_calls) {\n    alerts.push({\n      agent: agent.name,\n      severity: 'warning',\n      type: 'no_traffic',\n      message: `No calls recorded in the last 15 minutes — pipeline may be down`\n    });\n  }\n  if (agent.error_rate_pct > THRESHOLDS.error_rate_pct) {\n    alerts.push({\n      agent: agent.name,\n      severity: agent.error_rate_pct > 20 ? 'critical' : 'warning',\n      type: 'high_error_rate',\n      message: `Error rate ${agent.error_rate_pct}% exceeds threshold ${THRESHOLDS.error_rate_pct}%`,\n      value: agent.error_rate_pct\n    });\n  }\n  if (agent.p95_latency_ms > THRESHOLDS.p95_latency_ms) {\n    alerts.push({\n      agent: agent.name,\n      severity: 'warning',\n      type: 'high_latency',\n      message: `P95 latency ${agent.p95_latency_ms}ms exceeds threshold ${THRESHOLDS.p95_latency_ms}ms`,\n      value: agent.p95_latency_ms\n    });\n  }\n  if (agent.low_confidence_pct > THRESHOLDS.low_confidence_pct) {\n    alerts.push({\n      agent: agent.name,\n      severity: 'warning',\n      type: 'low_confidence_drift',\n      message: `${agent.low_confidence_pct}% of outputs below confidence threshold — possible prompt degradation`,\n      value: agent.low_confidence_pct\n    });\n  }\n}\n\nreturn [{\n  json: {\n    checked_at: new Date().toISOString(),\n    window_minutes: 15,\n    agent_count: metrics.agents.length,\n    alert_count: alerts.length,\n    alerts,\n    metrics: metrics.agents\n  }\n}];"
+      }
+    },
+    {
+      "id": "check-has-alerts",
+      "name": "Has Alerts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.alert_count }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "format-slack-alert",
+      "name": "Format Slack Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 180],
+      "parameters": {
+        "jsCode": "const { alerts, checked_at, window_minutes } = $input.first().json;\n\nconst hasCritical = alerts.some(a => a.severity === 'critical');\nconst emoji = hasCritical ? ':rotating_light:' : ':warning:';\nconst header = hasCritical ? '*CRITICAL — Agent Pipeline Alert*' : '*Agent Monitor Warning*';\n\nconst alertLines = alerts.map(a =>\n  `• *[${a.severity.toUpperCase()}]* ${a.agent}: ${a.message}`\n).join('\\n');\n\nreturn [{\n  json: {\n    text: `${emoji} ${header}`,\n    blocks: [\n      {\n        type: 'header',\n        text: { type: 'plain_text', text: `${emoji} ${hasCritical ? 'CRITICAL' : 'Warning'}: Agent Pipeline` }\n      },\n      {\n        type: 'section',\n        text: {\n          type: 'mrkdwn',\n          text: `*${alerts.length} alert(s)* detected in the last ${window_minutes} minutes:\\n\\n${alertLines}`\n        }\n      },\n      {\n        type: 'context',\n        elements: [{ type: 'mrkdwn', text: `Checked at ${checked_at}` }]\n      }\n    ]\n  }\n}];"
+      }
+    },
+    {
+      "id": "send-slack-alert",
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 180],
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK",
+        "body": "={{ $json }}",
+        "sendBody": true,
+        "specifyBody": "json"
+      }
+    },
+    {
+      "id": "write-metrics-log",
+      "name": "Write Metrics Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 420],
+      "parameters": {
+        "jsCode": "// Log all-clear tick to your metrics store\n// Replace with Supabase insert, HTTP POST to your logging endpoint, etc.\nconsole.log(JSON.stringify({\n  event: 'monitor_check',\n  checked_at: $json.checked_at,\n  alert_count: $json.alert_count,\n  agent_count: $json.agent_count\n}));\nreturn $input.all();"
+      }
+    }
+  ],
+  "connections": {
+    "schedule-trigger": { "main": [[ { "node": "fetch-agent-metrics", "type": "main", "index": 0 } ]] },
+    "fetch-agent-metrics": { "main": [[ { "node": "evaluate-thresholds", "type": "main", "index": 0 } ]] },
+    "evaluate-thresholds": { "main": [[ { "node": "check-has-alerts", "type": "main", "index": 0 } ]] },
+    "check-has-alerts": {
+      "main": [
+        [ { "node": "format-slack-alert", "type": "main", "index": 0 } ],
+        [ { "node": "write-metrics-log", "type": "main", "index": 0 } ]
+      ]
+    },
+    "format-slack-alert": { "main": [[ { "node": "send-slack-alert", "type": "main", "index": 0 } ]] },
+    "send-slack-alert": { "main": [[ { "node": "write-metrics-log", "type": "main", "index": 0 } ]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "description": "Every 15 minutes: fetch agent metrics, evaluate against thresholds (error rate, latency, confidence drift, zero traffic), alert Slack on violations.",
+    "pattern": "schedule-monitor-alert",
+    "version": "1.0.0"
+  }
+}

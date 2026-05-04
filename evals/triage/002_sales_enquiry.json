@@ -1,0 +1,10 @@
+{
+  "description": "Positive sales enquiry, no urgency",
+  "input": "Hello! I'm interested in learning more about your property listings in the inner south. Could someone reach out to discuss what's currently available? Budget around $1.2M.",
+  "expected": {
+    "category": "sales_enquiry",
+    "urgency": "normal",
+    "sentiment": "positive",
+    "requires_human_review": false
+  }
+}

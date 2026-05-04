@@ -1,0 +1,9 @@
+{
+  "description": "Billing question but could be support — low confidence expected",
+  "input": "I was charged twice last month. Not sure if this is a billing error or if I accidentally ordered twice. Can someone check?",
+  "expected": {
+    "category": "billing_question",
+    "urgency": "normal",
+    "sentiment": "neutral"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Frustrated customer, delayed order, time-sensitive",
+  "input": "Hi, I placed order #8821 three weeks ago and it still hasn't arrived. I need it for an event this Saturday. This is completely unacceptable — if it's not here by Friday I'm disputing the charge.",
+  "expected": {
+    "category": "support_request",
+    "urgency": "high",
+    "sentiment": "frustrated",
+    "requires_human_review": false
+  }
+}

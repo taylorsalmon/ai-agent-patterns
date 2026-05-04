@@ -1,0 +1,223 @@
+{
+  "name": "Inbound Triage Pipeline",
+  "nodes": [
+    {
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "parameters": {
+        "path": "inbound-enquiry",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "notes": "Receives inbound form submissions. Validate HMAC signature in production."
+    },
+    {
+      "id": "validate-payload",
+      "name": "Validate Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "jsCode": "// Validate required fields are present\nconst body = $input.first().json.body;\nconst required = ['message', 'email'];\nconst missing = required.filter(f => !body[f]);\n\nif (missing.length > 0) {\n  throw new Error(`Missing required fields: ${missing.join(', ')}`);\n}\n\n// Sanitise — strip HTML, trim whitespace\nreturn [{\n  json: {\n    message: body.message.replace(/<[^>]+>/g, '').trim(),\n    email: body.email.trim().toLowerCase(),\n    name: body.name?.trim() || null,\n    received_at: new Date().toISOString(),\n    source: body.source || 'web_form'\n  }\n}];"
+      }
+    },
+    {
+      "id": "claude-triage",
+      "name": "Claude — Triage Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headers": {
+          "values": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "body": {
+          "model": "claude-opus-4-5",
+          "max_tokens": 512,
+          "system": "You are a triage agent. Classify inbound enquiries and return structured JSON only. Categories: sales_enquiry, support_request, billing_question, feedback, spam, other. Return: {\"category\": string, \"confidence\": float, \"urgency\": \"low|normal|high|critical\", \"sentiment\": \"positive|neutral|negative|frustrated\", \"summary\": string, \"recommended_action\": string, \"requires_human_review\": boolean}",
+          "messages": [
+            {
+              "role": "user",
+              "content": "={{$json.message}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": false
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "YOUR_CLAUDE_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "parse-claude-response",
+      "name": "Parse Claude Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst text = response.content[0].text;\n\nlet classification;\ntry {\n  classification = JSON.parse(text);\n} catch (e) {\n  // Fallback if Claude returns non-JSON\n  classification = {\n    category: 'other',\n    confidence: 0,\n    urgency: 'normal',\n    sentiment: 'neutral',\n    summary: 'Could not parse classification',\n    recommended_action: 'human_review',\n    requires_human_review: true\n  };\n}\n\n// Merge with original payload\nconst original = $('validate-payload').first().json;\n\nreturn [{\n  json: {\n    ...original,\n    classification,\n    processed_at: new Date().toISOString()\n  }\n}];"
+      }
+    },
+    {
+      "id": "route-by-category",
+      "name": "Route by Category",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{$json.classification.category}}",
+        "rules": {
+          "values": [
+            { "outputKey": "sales_enquiry", "value": "sales_enquiry" },
+            { "outputKey": "support_request", "value": "support_request" },
+            { "outputKey": "billing_question", "value": "billing_question" },
+            { "outputKey": "human_review", "value": "other" }
+          ]
+        },
+        "fallbackOutput": "human_review"
+      }
+    },
+    {
+      "id": "create-crm-task",
+      "name": "Create CRM Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 160],
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-crm.com/api/v2/tasks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "body": {
+          "title": "={{$json.classification.summary}}",
+          "contact_email": "={{$json.email}}",
+          "category": "={{$json.classification.category}}",
+          "urgency": "={{$json.classification.urgency}}",
+          "source": "={{$json.source}}",
+          "received_at": "={{$json.received_at}}"
+        },
+        "sendBody": true,
+        "specifyBody": "json"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "YOUR_CRM_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "slack-human-review-alert",
+      "name": "Slack — Human Review Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 440],
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK",
+        "body": {
+          "text": ":eyes: *Requires human review*",
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*New enquiry requires review*\n*From:* {{$json.email}}\n*Category:* {{$json.classification.category}} (confidence: {{$json.classification.confidence}})\n*Summary:* {{$json.classification.summary}}"
+              }
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json"
+      }
+    },
+    {
+      "id": "write-log",
+      "name": "Write Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 300],
+      "parameters": {
+        "jsCode": "// Write to your logging system (Datadog, Supabase, S3, etc.)\n// Placeholder — replace with your logging endpoint\nconsole.log(JSON.stringify({\n  event: 'triage_complete',\n  task_id: $json.received_at + '_' + $json.email,\n  classification: $json.classification.category,\n  confidence: $json.classification.confidence,\n  urgency: $json.classification.urgency,\n  requires_human_review: $json.classification.requires_human_review,\n  processed_at: $json.processed_at\n}));\n\nreturn $input.all();"
+      }
+    },
+    {
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1780, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"received\", \"message\": \"Your enquiry has been received and will be responded to shortly.\"}"
+      }
+    },
+    {
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 500],
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK",
+        "body": {
+          "text": ":red_circle: *Pipeline error in Inbound Triage*\nError: {{$json.error.message}}\nWorkflow: inbound-triage-pipeline\nTimestamp: {{$now}}"
+        },
+        "sendBody": true,
+        "specifyBody": "json"
+      },
+      "notes": "Wire error outputs from all nodes here."
+    }
+  ],
+  "connections": {
+    "webhook-trigger": { "main": [[ { "node": "validate-payload", "type": "main", "index": 0 } ]] },
+    "validate-payload": { "main": [[ { "node": "claude-triage", "type": "main", "index": 0 } ]] },
+    "claude-triage": { "main": [[ { "node": "parse-claude-response", "type": "main", "index": 0 } ]] },
+    "parse-claude-response": { "main": [[ { "node": "route-by-category", "type": "main", "index": 0 } ]] },
+    "route-by-category": {
+      "main": [
+        [ { "node": "create-crm-task", "type": "main", "index": 0 } ],
+        [ { "node": "create-crm-task", "type": "main", "index": 0 } ],
+        [ { "node": "create-crm-task", "type": "main", "index": 0 } ],
+        [ { "node": "slack-human-review-alert", "type": "main", "index": 0 } ]
+      ]
+    },
+    "create-crm-task": { "main": [[ { "node": "write-log", "type": "main", "index": 0 } ]] },
+    "slack-human-review-alert": { "main": [[ { "node": "write-log", "type": "main", "index": 0 } ]] },
+    "write-log": { "main": [[ { "node": "webhook-response", "type": "main", "index": 0 } ]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "error-handler"
+  },
+  "meta": {
+    "description": "Receives inbound form submissions, classifies them with Claude, routes by category, creates CRM tasks, and alerts on edge cases.",
+    "pattern": "webhook-to-agent-to-action",
+    "version": "1.0.0"
+  }
+}

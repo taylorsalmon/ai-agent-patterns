@@ -1,0 +1,236 @@
+{
+  "name": "Document Extraction Pipeline",
+  "nodes": [
+    {
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "notes": "Runs every hour. Adjust to match your document ingestion cadence."
+    },
+    {
+      "id": "fetch-unprocessed-documents",
+      "name": "Fetch Unprocessed Documents",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "https://your-api.com/api/documents",
+        "queryParameters": {
+          "parameters": [
+            { "name": "status", "value": "unprocessed" },
+            { "name": "limit", "value": "10" },
+            { "name": "type", "value": "enquiry_form" }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": { "name": "YOUR_CRM_API_KEY" }
+      }
+    },
+    {
+      "id": "check-has-documents",
+      "name": "Check Has Documents",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.documents.length }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "split-into-items",
+      "name": "Split Into Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [900, 200],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "claude-extract",
+      "name": "Claude — Extract Fields",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headers": {
+          "values": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "body": {
+          "model": "claude-opus-4-5",
+          "max_tokens": 1024,
+          "system": "You are a data extraction agent. Extract structured fields from the document text provided. Return valid JSON only matching this schema: {\"customer_name\": string|null, \"email\": string|null, \"phone\": string|null, \"enquiry_type\": string|null, \"property_address\": string|null, \"budget\": number|null, \"timeline\": string|null, \"notes\": string|null, \"confidence\": float, \"missing_required_fields\": array}. Required fields: customer_name, email. Do not hallucinate data not present in the source.",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Extract fields from this document:\n\n={{ $json.document_text }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json"
+      },
+      "credentials": {
+        "httpHeaderAuth": { "name": "YOUR_CLAUDE_API_KEY" }
+      }
+    },
+    {
+      "id": "parse-extraction",
+      "name": "Parse Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200],
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst text = response.content[0].text;\nconst documentId = $('split-into-items').first().json.document_id;\n\nlet extracted;\ntry {\n  extracted = JSON.parse(text);\n} catch (e) {\n  return [{\n    json: {\n      document_id: documentId,\n      status: 'extraction_failed',\n      error: 'Could not parse Claude response',\n      requires_review: true\n    }\n  }];\n}\n\n// Flag low-confidence extractions for review\nconst requiresReview = extracted.confidence < 0.8 || extracted.missing_required_fields.length > 0;\n\nreturn [{\n  json: {\n    document_id: documentId,\n    extracted,\n    status: requiresReview ? 'review_required' : 'extraction_complete',\n    requires_review: requiresReview,\n    processed_at: new Date().toISOString()\n  }\n}];"
+      }
+    },
+    {
+      "id": "route-by-confidence",
+      "name": "Route by Confidence",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1560, 200],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.requires_review }}",
+              "value2": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "write-to-crm",
+      "name": "Write to CRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 100],
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-crm.com/api/v2/contacts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "body": {
+          "name": "={{ $json.extracted.customer_name }}",
+          "email": "={{ $json.extracted.email }}",
+          "phone": "={{ $json.extracted.phone }}",
+          "source_document_id": "={{ $json.document_id }}",
+          "custom_fields": {
+            "enquiry_type": "={{ $json.extracted.enquiry_type }}",
+            "budget": "={{ $json.extracted.budget }}",
+            "timeline": "={{ $json.extracted.timeline }}",
+            "extraction_confidence": "={{ $json.extracted.confidence }}"
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json"
+      },
+      "credentials": {
+        "httpHeaderAuth": { "name": "YOUR_CRM_API_KEY" }
+      }
+    },
+    {
+      "id": "flag-for-review",
+      "name": "Flag for Human Review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK",
+        "body": {
+          "text": ":warning: *Document extraction requires review*\nDocument ID: {{$json.document_id}}\nConfidence: {{$json.extracted.confidence}}\nMissing fields: {{$json.extracted.missing_required_fields}}"
+        },
+        "sendBody": true,
+        "specifyBody": "json"
+      }
+    },
+    {
+      "id": "mark-document-processed",
+      "name": "Mark Document Processed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 200],
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://your-api.com/api/documents/{{ $json.document_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "body": {
+          "status": "={{ $json.status }}",
+          "processed_at": "={{ $json.processed_at }}"
+        },
+        "sendBody": true,
+        "specifyBody": "json"
+      },
+      "credentials": {
+        "httpHeaderAuth": { "name": "YOUR_CRM_API_KEY" }
+      }
+    }
+  ],
+  "connections": {
+    "schedule-trigger": { "main": [[ { "node": "fetch-unprocessed-documents", "type": "main", "index": 0 } ]] },
+    "fetch-unprocessed-documents": { "main": [[ { "node": "check-has-documents", "type": "main", "index": 0 } ]] },
+    "check-has-documents": {
+      "main": [
+        [ { "node": "split-into-items", "type": "main", "index": 0 } ],
+        []
+      ]
+    },
+    "split-into-items": { "main": [[ { "node": "claude-extract", "type": "main", "index": 0 } ]] },
+    "claude-extract": { "main": [[ { "node": "parse-extraction", "type": "main", "index": 0 } ]] },
+    "parse-extraction": { "main": [[ { "node": "route-by-confidence", "type": "main", "index": 0 } ]] },
+    "route-by-confidence": {
+      "main": [
+        [ { "node": "write-to-crm", "type": "main", "index": 0 } ],
+        [ { "node": "flag-for-review", "type": "main", "index": 0 } ]
+      ]
+    },
+    "write-to-crm": { "main": [[ { "node": "mark-document-processed", "type": "main", "index": 0 } ]] },
+    "flag-for-review": { "main": [[ { "node": "mark-document-processed", "type": "main", "index": 0 } ]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "meta": {
+    "description": "Hourly: fetch unprocessed documents, extract structured fields with Claude, write high-confidence results to CRM, flag low-confidence for human review.",
+    "pattern": "schedule-extract-route",
+    "version": "1.0.0"
+  }
+}
