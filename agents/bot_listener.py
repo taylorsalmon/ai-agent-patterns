@@ -20,17 +20,20 @@ from pathlib import Path
 
 import anthropic
 import discord
+import requests
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
 
-ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-BRIAN_TOKEN   = os.environ["BRIAN_TOKEN"]
-SARAH_TOKEN   = os.environ["SARAH_TOKEN"]
-CHANNEL_ID    = int(os.environ["DISCORD_CHANNEL_ID"])
-BRAIN_PATH    = Path.home() / "Documents" / "Brain"
-LEADS_PATH    = BRAIN_PATH / "Leads"
+ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
+BRIAN_TOKEN     = os.environ["BRIAN_TOKEN"]
+SARAH_TOKEN     = os.environ["SARAH_TOKEN"]
+CHANNEL_ID      = int(os.environ["DISCORD_CHANNEL_ID"])
+BRAIN_PATH      = Path.home() / "Documents" / "Brain"
+LEADS_PATH      = BRAIN_PATH / "Leads"
+FIREBASE_URL    = os.environ.get("FIREBASE_URL", "")
+FIREBASE_SECRET = os.environ.get("FIREBASE_SECRET", "")
 
 claude   = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 executor = ThreadPoolExecutor(max_workers=4)
@@ -39,6 +42,38 @@ executor = ThreadPoolExecutor(max_workers=4)
 sarah_user_id: int | None = None
 
 LIST_TRIGGERS = ["list", "recent leads", "what leads", "who have we", "show me leads"]
+
+
+# ── Firebase CRM helpers ───────────────────────────────────────────────────────
+
+def _firebase_leads() -> list[dict]:
+    if not FIREBASE_URL or not FIREBASE_SECRET:
+        return []
+    r = requests.get(f"{FIREBASE_URL}/workspace/leads.json", params={"auth": FIREBASE_SECRET})
+    if not r.ok or not r.json():
+        return []
+    data = r.json()
+    return data if isinstance(data, list) else list(data.values())
+
+
+def _update_firebase_status(company: str, status: str, retainer: int | None = None) -> bool:
+    leads = _firebase_leads()
+    company_lower = company.lower()
+    idx = next(
+        (i for i, l in enumerate(leads) if isinstance(l, dict) and company_lower in l.get("biz", "").lower()),
+        None,
+    )
+    if idx is None:
+        return False
+    patch = {"status": status}
+    if retainer:
+        patch["monthlyRetainer"] = retainer
+    r = requests.patch(
+        f"{FIREBASE_URL}/workspace/leads/{idx}.json",
+        params={"auth": FIREBASE_SECRET},
+        json=patch,
+    )
+    return r.ok
 
 
 # ── Brain vault (Sarah only) ───────────────────────────────────────────────────
@@ -155,7 +190,14 @@ def convert_to_client(query: str, monthly_retainer: int | None) -> tuple[bool, s
     dest.write_text(content, encoding="utf-8")
     note_path.unlink()  # remove from Leads
 
-    return True, f"✅ **[[{note_path.stem}]]** moved to Clients and updated — ${monthly_retainer:,}/mo retainer logged."
+    # Mirror the conversion in the Firebase CRM
+    crm_updated = _update_firebase_status(note_path.stem, "won", monthly_retainer)
+    crm_note = " · CRM updated ✅" if crm_updated else " · CRM update failed ⚠️"
+
+    return True, (
+        f"✅ **[[{note_path.stem}]]** moved to Clients and updated — "
+        f"${monthly_retainer:,}/mo retainer logged.{crm_note}"
+    )
 
 
 # ── Company picker (Brian) ─────────────────────────────────────────────────────

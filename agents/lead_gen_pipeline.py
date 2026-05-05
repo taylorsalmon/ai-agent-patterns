@@ -27,10 +27,12 @@ from pathlib import Path
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-CHANNEL   = os.environ["DISCORD_CHANNEL_ID"]
-BRIAN_TOK = os.environ["BRIAN_TOKEN"]
-SARAH_TOK = os.environ["SARAH_TOKEN"]
-DISCORD   = "https://discord.com/api/v10"
+CHANNEL       = os.environ["DISCORD_CHANNEL_ID"]
+BRIAN_TOK     = os.environ["BRIAN_TOKEN"]
+SARAH_TOK     = os.environ["SARAH_TOKEN"]
+DISCORD       = "https://discord.com/api/v10"
+FIREBASE_URL  = os.environ.get("FIREBASE_URL", "")
+FIREBASE_SECRET = os.environ.get("FIREBASE_SECRET", "")
 
 
 # ── Discord helpers ────────────────────────────────────────────────────────────
@@ -258,6 +260,85 @@ tags: [lead, {tier}, unverified, {profile.get("industry", "").lower().replace(" 
     return note_path
 
 
+# ── Firebase CRM ──────────────────────────────────────────────────────────────
+
+def write_firebase_lead(profile: dict, qual: dict, draft: dict) -> bool:
+    """Append a new lead to the Firebase CRM leads array. Returns True on success."""
+    if not FIREBASE_URL or not FIREBASE_SECRET:
+        return False
+
+    params = {"auth": FIREBASE_SECRET}
+
+    # Get current leads to find next index
+    r = requests.get(f"{FIREBASE_URL}/workspace/leads.json", params=params)
+    current = r.json() if r.ok and r.json() else []
+    if not isinstance(current, list):
+        current = list(current.values()) if isinstance(current, dict) else []
+    next_index = len(current)
+
+    pain_points = profile.get("potential_pain_points", [])
+    platforms   = ", ".join(profile.get("active_platforms", []))
+    presence    = profile.get("social_media_presence", "unknown")
+
+    lead = {
+        "biz":       profile.get("company_name", ""),
+        "type":      profile.get("industry", ""),
+        "location":  profile.get("location", "") or "",
+        "email":     "",
+        "phone":     "",
+        "linkedin":  "",
+        "owner":     "",
+        "status":    "new",
+        "addedDate": datetime.now().strftime("%-d %b"),
+        "createdBy": "brian",
+        "online":    f"{presence.capitalize()} social presence · Platforms: {platforms or '—'}",
+        "pain":      " · ".join(pain_points[:3]),
+        "notes":     (
+            f"Score: {qual.get('score', 0)}/100 · Tier: {qual.get('tier', '').upper()} · "
+            f"Est. retainer: {qual.get('estimated_monthly_retainer', '—')}\n"
+            f"{qual.get('recommended_approach', '')}"
+        ),
+    }
+
+    r = requests.put(
+        f"{FIREBASE_URL}/workspace/leads/{next_index}.json",
+        params=params,
+        json=lead,
+    )
+    return r.ok
+
+
+def find_firebase_lead_index(company: str) -> int | None:
+    """Find the array index of a lead by fuzzy business name match."""
+    if not FIREBASE_URL or not FIREBASE_SECRET:
+        return None
+    r = requests.get(f"{FIREBASE_URL}/workspace/leads.json", params={"auth": FIREBASE_SECRET})
+    if not r.ok or not r.json():
+        return None
+    leads = r.json() if isinstance(r.json(), list) else list(r.json().values())
+    company_lower = company.lower()
+    for i, lead in enumerate(leads):
+        if isinstance(lead, dict) and company_lower in lead.get("biz", "").lower():
+            return i
+    return None
+
+
+def update_firebase_lead_status(company: str, status: str, retainer: int | None = None) -> bool:
+    """Update a lead's status (and optionally retainer) in Firebase."""
+    idx = find_firebase_lead_index(company)
+    if idx is None:
+        return False
+    patch = {"status": status}
+    if retainer:
+        patch["monthlyRetainer"] = retainer
+    r = requests.patch(
+        f"{FIREBASE_URL}/workspace/leads/{idx}.json",
+        params={"auth": FIREBASE_SECRET},
+        json=patch,
+    )
+    return r.ok
+
+
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 
 def run(company: str, website: str = ""):
@@ -364,11 +445,14 @@ def run(company: str, website: str = ""):
 
     post(BRIAN_TOK, embeds=[embed])
 
-    # ── Write to Obsidian Brain ────────────────────────────────────────────────
-    note_path = write_brain_note(profile, qual, draft)
+    # ── Write to Obsidian Brain + Firebase CRM ────────────────────────────────
+    note_path   = write_brain_note(profile, qual, draft)
+    crm_success = write_firebase_lead(profile, qual, draft)
+
     post(BRIAN_TOK,
-         f"🧠 **Brain updated** — lead note written to Obsidian\n"
-         f"> `Leads/{note_path.name}`\n"
+         f"🧠 **Brain + CRM updated**\n"
+         f"> Obsidian: `Leads/{note_path.name}`\n"
+         f"> CRM: {'✅ Added to leads board' if crm_success else '⚠️ CRM write failed'}\n"
          f"> Ask Sarah about it anytime.")
     print(f"\n✅ Done — Score: {score}/100  |  Tier: {tier}")
     print(f"   Brain note: {note_path}")
