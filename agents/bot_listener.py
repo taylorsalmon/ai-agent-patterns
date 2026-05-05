@@ -1,16 +1,12 @@
 """
 Bot Listener — Sarah & Brian respond to Discord mentions
 =========================================================
-Sarah  — outreach specialist, searches the full Brain vault and links
-         to relevant notes using Obsidian [[wiki links]]
-
-Brian  — pipeline manager, can trigger a full lead gen run from Discord
-         when asked to find a lead in a given industry or company
+Sarah  — owns the Brain vault. Searches notes, responds with [[wiki links]].
+Brian  — owns the pipeline. No Brain access. Reads Sarah's recent messages
+         from the channel when he needs lead context.
 
 Usage:
   python agents/bot_listener.py
-
-Keep running in a terminal. Ctrl+C to stop.
 """
 
 import asyncio
@@ -35,10 +31,13 @@ CHANNEL_ID    = int(os.environ["DISCORD_CHANNEL_ID"])
 BRAIN_PATH    = Path.home() / "Documents" / "Brain"
 LEADS_PATH    = BRAIN_PATH / "Leads"
 
-claude    = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-executor  = ThreadPoolExecutor(max_workers=4)
+claude   = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+executor = ThreadPoolExecutor(max_workers=4)
 
-# ── Intent detection keywords ──────────────────────────────────────────────────
+# Shared reference so Brian can look up Sarah's user ID at runtime
+sarah_user_id: int | None = None
+
+# ── Intent keywords ────────────────────────────────────────────────────────────
 
 PIPELINE_TRIGGERS = [
     "find me a lead", "find a lead", "research a lead", "run the pipeline",
@@ -49,13 +48,9 @@ PIPELINE_TRIGGERS = [
 LIST_TRIGGERS = ["list", "recent leads", "what leads", "who have we", "show me leads"]
 
 
-# ── Brain vault search ─────────────────────────────────────────────────────────
+# ── Brain vault (Sarah only) ───────────────────────────────────────────────────
 
 def search_brain(query: str, max_results: int = 4) -> tuple[list[dict], list[str]]:
-    """
-    Search the full Brain vault for query.
-    Returns (results, wiki_links) where wiki_links are Obsidian [[Note]] references.
-    """
     BRAIN_PATH.mkdir(parents=True, exist_ok=True)
     query_lower = query.lower()
     results = []
@@ -65,27 +60,21 @@ def search_brain(query: str, max_results: int = 4) -> tuple[list[dict], list[str
             content = note.read_text(encoding="utf-8")
         except Exception:
             continue
-
         name_match    = query_lower in note.stem.lower()
         content_match = query_lower in content.lower()
-
         if name_match or content_match:
-            # Score: name match ranks higher than content match
             score = (2 if name_match else 0) + (1 if content_match else 0)
-            # Relative path from Brain root for the wiki link
-            rel = note.relative_to(BRAIN_PATH)
+            rel    = note.relative_to(BRAIN_PATH)
             folder = rel.parent.name if rel.parent.name != "." else "Brain"
             results.append({
                 "stem":    note.stem,
                 "folder":  folder,
                 "score":   score,
                 "snippet": content[:400].strip(),
-                "path":    str(rel),
             })
 
     results.sort(key=lambda r: r["score"], reverse=True)
     results = results[:max_results]
-
     wiki_links = [f"[[{r['stem']}]]" for r in results]
     return results, wiki_links
 
@@ -94,31 +83,29 @@ def list_recent_leads(n: int = 6) -> str:
     LEADS_PATH.mkdir(parents=True, exist_ok=True)
     notes = sorted(LEADS_PATH.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
     if not notes:
-        return "No leads in the Brain yet — run the pipeline on a company to add one."
-    lines = [
+        return "No leads in the Brain yet."
+    return "\n".join(
         f"• **{note.stem}** — {datetime.fromtimestamp(note.stat().st_mtime).strftime('%d %b %Y')}"
         for note in notes[:n]
-    ]
-    return "\n".join(lines)
+    )
 
 
-# ── Company picker (Brian uses this to choose who to prospect) ─────────────────
+# ── Company picker (Brian) ─────────────────────────────────────────────────────
 
-def pick_target_company(industry_or_brief: str) -> dict:
-    """Ask Claude to suggest the single best target company for a given brief."""
+def pick_target_company(brief: str) -> dict:
     r = claude.messages.create(
         model="claude-opus-4-5",
         max_tokens=300,
         system=(
             "You are a business development strategist for Resolve Studios, a social media marketing agency. "
             "Given an industry or brief, suggest the single best Australian company to prospect "
-            "for social media management services — ideally one with a weak or inconsistent social presence "
+            "for social media management services — one with weak or inconsistent social presence "
             "but clear budget and growth signals. "
             "Return valid JSON only: "
-            "{\"company\": \"Company Name\", \"website\": \"https://...\", "
-            "\"reason\": \"one sentence why they're a strong social media prospect\"}"
+            "{\"company\": \"string\", \"website\": \"https://...\", "
+            "\"reason\": \"one sentence why they're a strong prospect\"}"
         ),
-        messages=[{"role": "user", "content": industry_or_brief}],
+        messages=[{"role": "user", "content": brief}],
     )
     text = r.content[0].text.strip()
     if "```" in text:
@@ -129,92 +116,92 @@ def pick_target_company(industry_or_brief: str) -> dict:
 # ── Claude persona replies ─────────────────────────────────────────────────────
 
 def sarah_reply(question: str, results: list[dict], wiki_links: list[str]) -> str:
-    if results:
-        brain_context = "\n\n".join(
-            f"[{r['folder']}/{r['stem']}]\n{r['snippet']}" for r in results
-        )
-        links_str = ", ".join(wiki_links) if wiki_links else "none"
-    else:
-        brain_context = "No matching notes found in the Brain vault."
-        links_str = "none"
+    brain_context = (
+        "\n\n".join(f"[{r['folder']}/{r['stem']}]\n{r['snippet']}" for r in results)
+        if results else "No matching notes found in the Brain vault."
+    )
+    links_str = ", ".join(wiki_links) if wiki_links else "none"
 
     system = f"""You are Sarah, an account manager at Resolve Studios, a social media marketing agency.
-You work with Brian who manages the lead pipeline. You have access to the team's Brain vault — lead research notes.
+You work alongside Brian who manages the lead pipeline. You are the keeper of the Brain vault.
 
-Your personality: warm, switched-on, commercially sharp. You talk like someone who knows their clients well.
+Personality: warm, switched-on, commercially sharp. Talk like someone who knows their clients well.
 Keep replies under 150 words. Use first person.
 
-When referencing Brain notes, use Obsidian wiki link format exactly as provided.
-Relevant wiki links for this query: {links_str}
+Use Obsidian [[wiki link]] format when referencing notes. Relevant links: {links_str}
 
-Brain vault content found:
+Brain vault content:
 {brain_context}
 
-If vault has relevant info, reference it naturally using [[wiki link]] format and mention social media specifics
-(platforms, content gaps, presence score) where relevant.
-If nothing found, say you don't have that prospect on file yet and suggest asking Brian to run the pipeline."""
+Reference vault info naturally, highlighting social media specifics (platforms, content gaps, presence).
+If nothing found, say so and suggest asking Brian to run the pipeline on them."""
 
     r = claude.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=300,
-        system=system,
+        model="claude-opus-4-5", max_tokens=300, system=system,
         messages=[{"role": "user", "content": question}],
     )
     return r.content[0].text.strip()
 
 
-def brian_reply(question: str, results: list[dict], wiki_links: list[str]) -> str:
-    brain_context = (
-        "\n\n".join(f"[{r['stem']}]\n{r['snippet']}" for r in results)
-        if results else "No matching notes found."
-    )
+def brian_reply(question: str, sarah_context: str) -> str:
+    system = f"""You are Brian, pipeline manager at Resolve Studios, a social media marketing agency.
+You work with Sarah — she owns the Brain vault, you own the pipeline.
 
-    system = f"""You are Brian, a pipeline manager agent. Efficient, operational, brief.
-Keep replies under 100 words.
+Personality: efficient, direct, operational. Under 100 words.
 
-Brain vault context:
-{brain_context}
+You do NOT have access to the Brain vault. If you need lead details, you rely on what Sarah
+has shared in the channel (shown below).
 
-If asked about pipeline status or leads, reference what's in the vault.
-Do NOT handle requests to find new leads — just answer the question asked."""
+Sarah's recent channel messages:
+{sarah_context if sarah_context else "Nothing from Sarah yet in this channel."}
+
+Use this context to answer pipeline or lead questions where relevant.
+If the question needs Brain vault details you don't have, say:
+"I'd check with Sarah on that — she has the full notes." """
 
     r = claude.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=200,
-        system=system,
+        model="claude-opus-4-5", max_tokens=200, system=system,
         messages=[{"role": "user", "content": question}],
     )
     return r.content[0].text.strip()
 
 
-# ── Run pipeline from within the bot (blocking → thread) ──────────────────────
+# ── Fetch Sarah's recent messages from the channel ────────────────────────────
+
+async def get_sarah_messages(channel: discord.TextChannel, limit: int = 20) -> str:
+    """Read the last `limit` messages and return those sent by Sarah."""
+    if sarah_user_id is None:
+        return ""
+    messages = []
+    async for msg in channel.history(limit=limit):
+        if msg.author.id == sarah_user_id and msg.content:
+            messages.append(f"[{msg.created_at.strftime('%H:%M')}] Sarah: {msg.content[:300]}")
+    messages.reverse()
+    return "\n".join(messages)
+
+
+# ── Pipeline runner ────────────────────────────────────────────────────────────
 
 def _run_pipeline_sync(company: str, website: str):
-    """Import and call the pipeline run() function in a thread."""
     sys.path.insert(0, str(Path(__file__).parent))
     from lead_gen_pipeline import run
     run(company, website)
 
 
 async def trigger_pipeline(company: str, website: str):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, _run_pipeline_sync, company, website)
+    await asyncio.get_event_loop().run_in_executor(executor, _run_pipeline_sync, company, website)
 
 
-# ── Shared intent parser ───────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def clean(text: str) -> str:
     return re.sub(r"<@!?\d+>", "", text).strip()
 
-
 def is_pipeline_request(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in PIPELINE_TRIGGERS)
-
+    return any(t in text.lower() for t in PIPELINE_TRIGGERS)
 
 def is_list_request(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in LIST_TRIGGERS)
+    return any(t in text.lower() for t in LIST_TRIGGERS)
 
 
 # ── Discord clients ────────────────────────────────────────────────────────────
@@ -225,7 +212,9 @@ intents.message_content = True
 
 class SarahBot(discord.Client):
     async def on_ready(self):
-        print(f"  ✅ Sarah online ({self.user})")
+        global sarah_user_id
+        sarah_user_id = self.user.id
+        print(f"  ✅ Sarah online ({self.user}) — Brain vault access: YES")
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or message.channel.id != CHANNEL_ID:
@@ -235,9 +224,13 @@ class SarahBot(discord.Client):
 
         question = clean(message.content)
         if not question:
-            await message.channel.send(
-                "Hey! Ask me about a lead, a company, or anything in the Brain."
-            )
+            await message.channel.send("Hey! Ask me about a lead or anything in the Brain.")
+            return
+
+        # List leads shortcut
+        if is_list_request(question):
+            recent = await asyncio.get_event_loop().run_in_executor(executor, list_recent_leads)
+            await message.channel.send(f"**Recent leads in the Brain:**\n{recent}")
             return
 
         async with message.channel.typing():
@@ -247,13 +240,12 @@ class SarahBot(discord.Client):
             reply = await asyncio.get_event_loop().run_in_executor(
                 executor, sarah_reply, question, results, wiki_links
             )
-
         await message.channel.send(reply)
 
 
 class BrianBot(discord.Client):
     async def on_ready(self):
-        print(f"  ✅ Brian online ({self.user})")
+        print(f"  ✅ Brian online ({self.user}) — Brain vault access: NO (reads Sarah's messages)")
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or message.channel.id != CHANNEL_ID:
@@ -264,16 +256,8 @@ class BrianBot(discord.Client):
         question = clean(message.content)
         if not question:
             await message.channel.send(
-                "Brian here. Ask me to find a lead, run the pipeline, or check recent leads."
+                "Brian here. Ask me to find a lead, run the pipeline, or check pipeline status."
             )
-            return
-
-        # ── List recent leads ──────────────────────────────────────────────────
-        if is_list_request(question):
-            recent = await asyncio.get_event_loop().run_in_executor(
-                executor, list_recent_leads
-            )
-            await message.channel.send(f"**Recent leads in the Brain:**\n{recent}")
             return
 
         # ── Trigger pipeline ───────────────────────────────────────────────────
@@ -291,25 +275,20 @@ class BrianBot(discord.Client):
                 f"🎯 Best target for **\"{question}\"**:\n"
                 f"> **{target['company']}** — {target.get('website', 'no website')}\n"
                 f"> {target['reason']}\n\n"
-                f"⚠️ **Heads up — this is an AI suggestion, not a verified business.** "
-                f"Confirm they exist before outreach. Kicking off the research now..."
+                f"⚠️ AI-suggested — verify they exist before outreach. Kicking off now..."
             )
-
             try:
                 await trigger_pipeline(target["company"], target.get("website", ""))
             except Exception as e:
                 await message.channel.send(f"❌ Pipeline failed: {e}")
             return
 
-        # ── General question ───────────────────────────────────────────────────
+        # ── General question — Brian reads Sarah's recent messages for context ──
         async with message.channel.typing():
-            results, _ = await asyncio.get_event_loop().run_in_executor(
-                executor, search_brain, question
-            )
+            sarah_context = await get_sarah_messages(message.channel)
             reply = await asyncio.get_event_loop().run_in_executor(
-                executor, brian_reply, question, results, []
+                executor, brian_reply, question, sarah_context
             )
-
         await message.channel.send(reply)
 
 
