@@ -91,10 +91,11 @@ def classify_intent(message: str) -> dict:
         max_tokens=100,
         system=(
             "Classify the intent of a message sent to Brian, a pipeline manager at a social media agency. "
-            "Use find_lead for any request to find, prospect, research, chase, or identify a new lead or target — "
-            "even if phrased as a question like 'who should we go after in X'. "
-            "Use list_leads only if asking to see existing leads already in the system. "
-            "Use general for everything else. "
+            "Use find_lead when the user wants to find, source, prospect, or research a NEW lead — "
+            "any phrasing that implies finding someone we haven't approached yet. "
+            "Use list_leads when asking what leads already exist in the system. "
+            "Use general for status, pipeline, or other questions. "
+            "When in doubt between find_lead and list_leads, prefer find_lead. "
             "Return valid JSON only: "
             "{\"intent\": \"find_lead | list_leads | general\", "
             "\"brief\": \"extracted industry/location/type brief for find_lead, else null\"}"
@@ -158,21 +159,48 @@ If nothing found, say so and suggest asking Brian to run the pipeline on them.""
     return r.content[0].text.strip()
 
 
-def brian_reply(question: str, sarah_context: str) -> str:
+def get_leads_context(query: str) -> str:
+    """Brian's only vault access — read-only search of the Leads folder."""
+    LEADS_PATH.mkdir(parents=True, exist_ok=True)
+    query_lower = query.lower()
+    matches = []
+
+    for note in LEADS_PATH.glob("*.md"):
+        try:
+            content = note.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if query_lower in note.stem.lower() or query_lower in content.lower():
+            matches.append(f"### {note.stem}\n{content[:500].strip()}")
+
+    if not matches:
+        # No query match — return all lead summaries (name + score line only)
+        summaries = []
+        for note in sorted(LEADS_PATH.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)[:8]:
+            try:
+                first_lines = note.read_text(encoding="utf-8")[:200]
+            except Exception:
+                continue
+            summaries.append(f"• {note.stem}: {first_lines.splitlines()[0] if first_lines else ''}")
+        return "\n".join(summaries) if summaries else "No leads on file yet."
+
+    return "\n\n---\n\n".join(matches[:3])
+
+
+def brian_reply(question: str, leads_context: str, sarah_context: str) -> str:
     system = f"""You are Brian, pipeline manager at Resolve Studios, a social media marketing agency.
-You work with Sarah — she owns the Brain vault, you own the pipeline.
+You work with Sarah — she owns the full Brain vault, you manage the pipeline and have read access to the Leads folder.
 
 Personality: efficient, direct, operational. Under 100 words.
 
-You do NOT have access to the Brain vault. If you need lead details, you rely on what Sarah
-has shared in the channel (shown below).
+Leads folder (your data):
+{leads_context}
 
-Sarah's recent channel messages:
-{sarah_context if sarah_context else "Nothing from Sarah yet in this channel."}
+Sarah's recent channel messages (for additional context):
+{sarah_context if sarah_context else "Nothing recent from Sarah."}
 
-Use this context to answer pipeline or lead questions where relevant.
-If the question needs Brain vault details you don't have, say:
-"I'd check with Sarah on that — she has the full notes." """
+Answer confidently using the leads data above. If a specific detail isn't in your leads folder,
+say Sarah would have the full notes."""
 
     r = claude.messages.create(
         model="claude-opus-4-5", max_tokens=200, system=system,
@@ -282,9 +310,12 @@ class BrianBot(discord.Client):
 
         # ── List leads ─────────────────────────────────────────────────────────
         if intent == "list_leads" or is_list_request(question):
+            leads_context = await asyncio.get_event_loop().run_in_executor(
+                executor, get_leads_context, question
+            )
             sarah_context = await get_sarah_messages(message.channel)
             reply = await asyncio.get_event_loop().run_in_executor(
-                executor, brian_reply, question, sarah_context
+                executor, brian_reply, question, leads_context, sarah_context
             )
             await message.channel.send(reply)
             return
@@ -314,9 +345,12 @@ class BrianBot(discord.Client):
 
         # ── General question ───────────────────────────────────────────────────
         async with message.channel.typing():
+            leads_context = await asyncio.get_event_loop().run_in_executor(
+                executor, get_leads_context, question
+            )
             sarah_context = await get_sarah_messages(message.channel)
             reply = await asyncio.get_event_loop().run_in_executor(
-                executor, brian_reply, question, sarah_context
+                executor, brian_reply, question, leads_context, sarah_context
             )
         await message.channel.send(reply)
 
