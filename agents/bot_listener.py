@@ -20,6 +20,7 @@ from pathlib import Path
 
 import anthropic
 import discord
+from difflib import SequenceMatcher
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
@@ -46,11 +47,20 @@ CLIENTS_PATH = BRAIN_PATH / "Clients"
 
 
 def fuzzy_match(query: str, target: str) -> int:
-    """Score how well query words appear in target. Returns 0 if no match."""
+    """Score query words against target, tolerating typos via SequenceMatcher."""
     words = [w for w in re.sub(r"[^\w\s]", "", query.lower()).split() if len(w) > 2]
+    target_words = re.sub(r"[^\w\s]", "", target.lower()).split()
     if not words:
         return 0
-    hits = sum(1 for w in words if w in target.lower())
+    hits = 0
+    for qw in words:
+        if qw in target.lower():
+            hits += 2  # exact substring
+            continue
+        for tw in target_words:
+            if SequenceMatcher(None, qw, tw).ratio() > 0.75:
+                hits += 1  # close enough (handles typos like clareden/clarendon)
+                break
     return hits
 
 
@@ -150,17 +160,25 @@ def convert_to_client(query: str, monthly_retainer: int | None) -> tuple[bool, s
 
 # ── Company picker (Brian) ─────────────────────────────────────────────────────
 
-def classify_sarah_intent(message: str) -> dict:
-    """Classify what Sarah should do."""
+def classify_sarah_intent(message: str, recent_context: str = "") -> dict:
+    """Classify what Sarah should do, with optional recent channel context."""
+    context_block = (
+        f"\nRecent conversation context (last few messages):\n{recent_context}\n"
+        if recent_context else ""
+    )
     r = claude.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=150,
         system=(
             "Classify the intent of a message sent to Sarah, an account manager at a social media agency. "
+            f"{context_block}"
             "Intents: "
-            "convert_to_client — user wants to move a lead to client status (words like: convert, move to client, they signed, onboard, paying); "
-            "list_leads — user wants to see what's in the Leads folder; "
-            "search — user is asking about a specific company or lead; "
+            "convert_to_client — user wants to move a lead to client status. "
+            "This includes follow-up messages where Sarah previously asked for the company name and the user is now providing it. "
+            "If the context shows Sarah asked 'which company?' and the user replied with a name, that is convert_to_client. "
+            "convert_to_client triggers on: convert, move to client, they signed, onboard, paying, confirmed, just got off the call. "
+            "list_leads — user wants to see what's in the Leads folder. "
+            "search — user is asking about a specific company or lead. "
             "general — anything else. "
             "Return valid JSON only: "
             "{\"intent\": \"convert_to_client|list_leads|search|general\", "
@@ -358,9 +376,18 @@ class SarahBot(discord.Client):
             await message.channel.send("Hey! Ask me about a lead, or tell me to convert one to a client.")
             return
 
+        # Fetch recent messages so Sarah understands follow-up context
+        recent_msgs = []
+        async for msg in message.channel.history(limit=6):
+            if msg.id == message.id:
+                continue
+            author = "Sarah" if (sarah_user_id and msg.author.id == sarah_user_id) else msg.author.display_name
+            recent_msgs.append(f"{author}: {msg.content[:150]}")
+        recent_context = "\n".join(reversed(recent_msgs))
+
         async with message.channel.typing():
             intent_data = await asyncio.get_event_loop().run_in_executor(
-                executor, classify_sarah_intent, question
+                executor, classify_sarah_intent, question, recent_context
             )
         intent   = intent_data.get("intent", "general")
         company  = intent_data.get("company")
