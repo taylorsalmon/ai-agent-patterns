@@ -42,33 +42,55 @@ LIST_TRIGGERS = ["list", "recent leads", "what leads", "who have we", "show me l
 
 # ── Brain vault (Sarah only) ───────────────────────────────────────────────────
 
+CLIENTS_PATH = BRAIN_PATH / "Clients"
+
+
+def fuzzy_match(query: str, target: str) -> int:
+    """Score how well query words appear in target. Returns 0 if no match."""
+    words = [w for w in re.sub(r"[^\w\s]", "", query.lower()).split() if len(w) > 2]
+    if not words:
+        return 0
+    hits = sum(1 for w in words if w in target.lower())
+    return hits
+
+
+def find_note(query: str) -> Path | None:
+    """Find a single best-matching note anywhere in the Brain vault."""
+    best_score, best_path = 0, None
+    for note in BRAIN_PATH.rglob("*.md"):
+        score = fuzzy_match(query, note.stem)
+        if score > best_score:
+            best_score, best_path = score, note
+    return best_path if best_score > 0 else None
+
+
 def search_brain(query: str, max_results: int = 4) -> tuple[list[dict], list[str]]:
     BRAIN_PATH.mkdir(parents=True, exist_ok=True)
-    query_lower = query.lower()
-    results = []
+    scored = []
 
     for note in BRAIN_PATH.rglob("*.md"):
         try:
             content = note.read_text(encoding="utf-8")
         except Exception:
             continue
-        name_match    = query_lower in note.stem.lower()
-        content_match = query_lower in content.lower()
-        if name_match or content_match:
-            score = (2 if name_match else 0) + (1 if content_match else 0)
+        name_score    = fuzzy_match(query, note.stem) * 2
+        content_score = 1 if query.lower() in content.lower() else 0
+        total = name_score + content_score
+        if total > 0:
             rel    = note.relative_to(BRAIN_PATH)
             folder = rel.parent.name if rel.parent.name != "." else "Brain"
-            results.append({
+            scored.append({
                 "stem":    note.stem,
                 "folder":  folder,
-                "score":   score,
+                "score":   total,
                 "snippet": content[:400].strip(),
+                "path":    note,
             })
 
-    results.sort(key=lambda r: r["score"], reverse=True)
-    results = results[:max_results]
-    wiki_links = [f"[[{r['stem']}]]" for r in results]
-    return results, wiki_links
+    scored.sort(key=lambda r: r["score"], reverse=True)
+    scored = scored[:max_results]
+    wiki_links = [f"[[{r['stem']}]]" for r in scored]
+    return scored, wiki_links
 
 
 def list_recent_leads(n: int = 6) -> str:
@@ -82,7 +104,76 @@ def list_recent_leads(n: int = 6) -> str:
     )
 
 
+def convert_to_client(query: str, monthly_retainer: int | None) -> tuple[bool, str]:
+    """
+    Move a lead note from Leads/ to Clients/, update its frontmatter.
+    Returns (success, message).
+    """
+    note_path = find_note(query)
+    if not note_path:
+        return False, f"Couldn't find a note matching '{query}' in the vault."
+
+    # Only move from Leads — don't touch notes already in Clients or elsewhere
+    if LEADS_PATH not in note_path.parents and note_path.parent != LEADS_PATH:
+        return False, f"[[{note_path.stem}]] isn't in the Leads folder — it may already be a client."
+
+    CLIENTS_PATH.mkdir(parents=True, exist_ok=True)
+    dest = CLIENTS_PATH / note_path.name
+
+    content = note_path.read_text(encoding="utf-8")
+    today   = datetime.now().strftime("%Y-%m-%d")
+
+    # Update frontmatter fields
+    content = re.sub(r"^verified:.*$",        "verified: true",           content, flags=re.MULTILINE)
+    content = re.sub(r"^tags:.*$",
+                     f"tags: [client, active]",                           content, flags=re.MULTILINE)
+
+    # Inject or update status + client fields after the closing ---
+    client_block = (
+        f"\nstatus: client\n"
+        f"date_converted: {today}\n"
+        f"monthly_retainer: {monthly_retainer or 'TBC'}\n"
+    )
+    if "status:" in content:
+        content = re.sub(r"^status:.*$", f"status: client", content, flags=re.MULTILINE)
+    else:
+        content = content.replace("---\n", f"---{client_block}", 1)
+
+    # Append a conversion log entry
+    content += f"\n\n## Conversion Log\n- **{today}** — Converted to client. Retainer: ${monthly_retainer:,}/mo\n"
+
+    dest.write_text(content, encoding="utf-8")
+    note_path.unlink()  # remove from Leads
+
+    return True, f"✅ **[[{note_path.stem}]]** moved to Clients and updated — ${monthly_retainer:,}/mo retainer logged."
+
+
 # ── Company picker (Brian) ─────────────────────────────────────────────────────
+
+def classify_sarah_intent(message: str) -> dict:
+    """Classify what Sarah should do."""
+    r = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        system=(
+            "Classify the intent of a message sent to Sarah, an account manager at a social media agency. "
+            "Intents: "
+            "convert_to_client — user wants to move a lead to client status (words like: convert, move to client, they signed, onboard, paying); "
+            "list_leads — user wants to see what's in the Leads folder; "
+            "search — user is asking about a specific company or lead; "
+            "general — anything else. "
+            "Return valid JSON only: "
+            "{\"intent\": \"convert_to_client|list_leads|search|general\", "
+            "\"company\": \"company name if mentioned, else null\", "
+            "\"monthly_retainer\": <integer dollars per month if mentioned, else null>}"
+        ),
+        messages=[{"role": "user", "content": message}],
+    )
+    text = r.content[0].text.strip()
+    if "```" in text:
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+    return json.loads(text.strip())
+
 
 def classify_intent(message: str) -> dict:
     """Use Claude to classify what Brian should do with this message."""
@@ -264,18 +355,41 @@ class SarahBot(discord.Client):
 
         question = clean(message.content)
         if not question:
-            await message.channel.send("Hey! Ask me about a lead or anything in the Brain.")
-            return
-
-        # List leads shortcut
-        if is_list_request(question):
-            recent = await asyncio.get_event_loop().run_in_executor(executor, list_recent_leads)
-            await message.channel.send(f"**Recent leads in the Brain:**\n{recent}")
+            await message.channel.send("Hey! Ask me about a lead, or tell me to convert one to a client.")
             return
 
         async with message.channel.typing():
+            intent_data = await asyncio.get_event_loop().run_in_executor(
+                executor, classify_sarah_intent, question
+            )
+        intent   = intent_data.get("intent", "general")
+        company  = intent_data.get("company")
+        retainer = intent_data.get("monthly_retainer")
+
+        # ── List leads ─────────────────────────────────────────────────────────
+        if intent == "list_leads":
+            recent = await asyncio.get_event_loop().run_in_executor(executor, list_recent_leads)
+            await message.channel.send(f"**Leads in the Brain:**\n{recent}")
+            return
+
+        # ── Convert lead → client ──────────────────────────────────────────────
+        if intent == "convert_to_client":
+            if not company:
+                await message.channel.send(
+                    "Which company are we converting? Give me the name and I'll move them to Clients."
+                )
+                return
+            async with message.channel.typing():
+                success, msg = await asyncio.get_event_loop().run_in_executor(
+                    executor, convert_to_client, company, retainer
+                )
+            await message.channel.send(msg)
+            return
+
+        # ── Search / general ───────────────────────────────────────────────────
+        async with message.channel.typing():
             results, wiki_links = await asyncio.get_event_loop().run_in_executor(
-                executor, search_brain, question
+                executor, search_brain, company or question
             )
             reply = await asyncio.get_event_loop().run_in_executor(
                 executor, sarah_reply, question, results, wiki_links
