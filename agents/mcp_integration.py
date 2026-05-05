@@ -116,11 +116,25 @@ def execute_tool(name: str, inputs: dict) -> str:
     return json.dumps(result)
 
 
+MAX_ITERATIONS = 10  # hard stop — prevents runaway loops burning tokens
+
+
 def run_agent(enquiry: str) -> str:
-    """Run the agent until it produces a final text response."""
+    """Run the agent until it produces a final text response.
+
+    Two circuit breakers prevent infinite loops:
+      1. Max iterations — hard cap on total tool-call rounds.
+      2. Repetition detection — if the agent calls the same tool with identical
+         arguments twice in a row, it's stuck and won't recover on its own.
+    """
     messages = [{"role": "user", "content": enquiry}]
+    iterations = 0
+    last_call: tuple[str, str] | None = None  # (tool_name, serialised_input)
 
     while True:
+        if iterations >= MAX_ITERATIONS:
+            return f"Circuit breaker: agent did not resolve after {MAX_ITERATIONS} iterations."
+
         response = client.messages.create(
             model="claude-opus-4-5",
             max_tokens=1024,
@@ -128,6 +142,7 @@ def run_agent(enquiry: str) -> str:
             tools=TOOLS,
             messages=messages,
         )
+        iterations += 1
 
         if response.stop_reason == "end_turn":
             # Final response — extract text
@@ -143,6 +158,15 @@ def run_agent(enquiry: str) -> str:
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
+                    # Repetition detection — same tool, same args = stuck
+                    call_signature = (block.name, json.dumps(block.input, sort_keys=True))
+                    if call_signature == last_call:
+                        return (
+                            f"Circuit breaker: agent called {block.name} with identical "
+                            f"arguments twice in a row — aborting to prevent infinite loop."
+                        )
+                    last_call = call_signature
+
                     print(f"  [tool] {block.name}({json.dumps(block.input)})")
                     result = execute_tool(block.name, block.input)
                     tool_results.append({
