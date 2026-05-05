@@ -204,7 +204,8 @@ tier: {tier}
 estimated_retainer: {retainer}
 outreach_channel: {draft.get("channel", "linkedin")}
 date_added: {today}
-tags: [lead, {tier}, {profile.get("industry", "").lower().replace(" ", "-")}]
+verified: false
+tags: [lead, {tier}, unverified, {profile.get("industry", "").lower().replace(" ", "-")}]
 ---
 
 # {company}  {tier_emoji} {score}/100

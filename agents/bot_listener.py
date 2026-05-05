@@ -291,7 +291,8 @@ class BrianBot(discord.Client):
                 f"🎯 Best target for **\"{question}\"**:\n"
                 f"> **{target['company']}** — {target.get('website', 'no website')}\n"
                 f"> {target['reason']}\n\n"
-                f"Kicking off the pipeline now..."
+                f"⚠️ **Heads up — this is an AI suggestion, not a verified business.** "
+                f"Confirm they exist before outreach. Kicking off the research now..."
             )
 
             try:
