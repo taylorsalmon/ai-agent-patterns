@@ -80,52 +80,67 @@ def parse_json(text: str) -> dict:
 
 # ── System prompts ─────────────────────────────────────────────────────────────
 
-RESEARCH_PROMPT = """You are a lead research agent. Given a company name and optional website,
-return a structured company profile as valid JSON only.
+AGENCY_NAME = "Resolve Studios"
+AGENCY_SERVICES = "social media management, content creation, paid social advertising, and brand growth on Instagram, TikTok, Facebook, and LinkedIn"
 
-{
+RESEARCH_PROMPT = f"""You are a lead research agent working for {AGENCY_NAME}, a social media marketing agency.
+Given a company name and optional website, research the company and return a structured profile
+focused on their social media presence and marketing opportunity.
+
+Return valid JSON only:
+{{
   "company_name": "string",
   "industry": "string",
   "estimated_size": "startup | smb | mid-market | enterprise",
   "location": "string or null",
   "what_they_do": "2-3 sentence description",
-  "recent_signals": ["growth signals, news, or observations"],
-  "decision_maker_titles": ["titles of people who would buy AI services"],
-  "tech_stack_signals": ["technology signals you can infer"],
-  "potential_pain_points": ["business problems AI could solve"]
-}"""
+  "social_media_presence": "strong | moderate | weak | none — based on what you can infer",
+  "active_platforms": ["platforms they likely use e.g. Instagram, LinkedIn, TikTok"],
+  "content_gaps": ["types of content they are likely missing or underutilising"],
+  "recent_signals": ["growth signals, campaigns, launches, or news worth referencing"],
+  "decision_maker_titles": ["titles of people who buy marketing services e.g. Marketing Manager, CMO, Founder"],
+  "potential_pain_points": ["social media and marketing problems {AGENCY_NAME} could solve for them"]
+}}"""
 
-QUALIFICATION_PROMPT = """You are a lead qualification agent. Score and qualify this company
-for an AI engineering services pitch (custom Claude agents, n8n pipelines, API integrations).
+QUALIFICATION_PROMPT = f"""You are a lead qualification agent for {AGENCY_NAME}, a social media marketing agency
+offering {AGENCY_SERVICES}.
+
+Score this company as a potential social media management client.
+
+Score high if: they have weak or inconsistent social presence, they're in a visual or consumer-facing industry,
+they're growing and would benefit from brand awareness, or they have budget signals.
 
 Return valid JSON only:
-{
+{{
   "score": <integer 0-100>,
   "tier": "hot | warm | cold",
-  "fit_reasons": ["why this is a good fit"],
-  "risks": ["reasons they might not buy"],
-  "recommended_approach": "one paragraph on how to approach this lead",
+  "fit_reasons": ["why they're a good fit for social media services"],
+  "risks": ["reasons they might not convert"],
+  "recommended_approach": "one paragraph — what angle to lead with and why",
   "urgency": "low | normal | high",
-  "estimated_deal_size": "small (<$10k) | medium ($10k-$50k) | large (>$50k)"
-}"""
+  "estimated_monthly_retainer": "small (<$2k/mo) | medium ($2k-$5k/mo) | large (>$5k/mo)"
+}}"""
 
-OUTREACH_PROMPT = """You are Sarah, an outreach specialist. Write a short personalised
-first-touch LinkedIn message for this lead.
+OUTREACH_PROMPT = f"""You are Sarah, an account manager at {AGENCY_NAME}, a social media marketing agency.
+Write a short, personalised first-touch outreach message for this prospect.
+
+{AGENCY_NAME} offers: {AGENCY_SERVICES}.
 
 Rules:
 - Max 120 words
-- Reference something specific about their business
-- Lead with value, not credentials
-- One clear CTA: a 20-minute call
-- Sound human — no buzzwords like leverage, synergy, cutting-edge
+- Reference something specific and real about their business or social presence
+- Lead with what we can do for them, not who we are
+- One clear CTA: a free 15-minute social media audit call
+- Sound like a real person — warm, confident, not salesy
+- No buzzwords: no "leverage", "synergy", "elevate your brand", "take it to the next level"
 
 Return valid JSON only:
-{
+{{
   "message": "the full message text",
   "channel": "linkedin | email",
   "subject": "subject line if email, else null",
-  "personalisation_hook": "the specific detail you used"
-}"""
+  "personalisation_hook": "the specific detail you used to personalise this"
+}}"""
 
 
 # ── Agent calls ────────────────────────────────────────────────────────────────
@@ -176,14 +191,17 @@ def write_brain_note(profile: dict, qual: dict, draft: dict) -> Path:
     risks        = "\n".join(f"- {r}" for r in qual.get("risks", []))
     dm_titles    = ", ".join(profile.get("decision_maker_titles", []))
 
+    retainer = qual.get("estimated_monthly_retainer", qual.get("estimated_deal_size", ""))
     note = f"""---
 company: {company}
 industry: {profile.get("industry", "")}
 size: {profile.get("estimated_size", "")}
 location: {profile.get("location", "")}
+social_presence: {profile.get("social_media_presence", "")}
+active_platforms: {", ".join(profile.get("active_platforms", []))}
 score: {score}
 tier: {tier}
-deal_size: {qual.get("estimated_deal_size", "")}
+estimated_retainer: {retainer}
 outreach_channel: {draft.get("channel", "linkedin")}
 date_added: {today}
 tags: [lead, {tier}, {profile.get("industry", "").lower().replace(" ", "-")}]
@@ -197,6 +215,8 @@ tags: [lead, {tier}, {profile.get("industry", "").lower().replace(" ", "-")}]
 **Industry:** {profile.get("industry", "")}
 **Size:** {profile.get("estimated_size", "")}
 **Location:** {profile.get("location", "")}
+**Social presence:** {profile.get("social_media_presence", "unknown")}
+**Active platforms:** {", ".join(profile.get("active_platforms", [])) or "—"}
 **Decision makers:** {dm_titles}
 
 ## Signals
@@ -329,7 +349,7 @@ def run(company: str, website: str = ""):
             {"name": "Size",        "value": profile.get("estimated_size", "—"),                  "inline": True},
             {"name": "Location",    "value": profile.get("location") or "—",                      "inline": True},
             {"name": f"Score  {tier_emoji} {tier}",
-                                    "value": f"**{score}/100** — {qual.get('estimated_deal_size','—')}", "inline": True},
+                                    "value": f"**{score}/100** — {qual.get('estimated_monthly_retainer', qual.get('estimated_deal_size','—'))}", "inline": True},
             {"name": "Urgency",     "value": qual.get("urgency", "normal").capitalize(),           "inline": True},
             {"name": "Channel",     "value": draft.get("channel", "linkedin").capitalize(),        "inline": True},
             {"name": "What They Do","value": profile.get("what_they_do", "—"),                    "inline": False},

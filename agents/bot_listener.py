@@ -110,11 +110,13 @@ def pick_target_company(industry_or_brief: str) -> dict:
         model="claude-opus-4-5",
         max_tokens=300,
         system=(
-            "You are a B2B sales strategist. Given an industry or brief, suggest the single "
-            "best Australian company to prospect for AI engineering services. "
+            "You are a business development strategist for Resolve Studios, a social media marketing agency. "
+            "Given an industry or brief, suggest the single best Australian company to prospect "
+            "for social media management services — ideally one with a weak or inconsistent social presence "
+            "but clear budget and growth signals. "
             "Return valid JSON only: "
             "{\"company\": \"Company Name\", \"website\": \"https://...\", "
-            "\"reason\": \"one sentence why this is the best target\"}"
+            "\"reason\": \"one sentence why they're a strong social media prospect\"}"
         ),
         messages=[{"role": "user", "content": industry_or_brief}],
     )
@@ -136,20 +138,21 @@ def sarah_reply(question: str, results: list[dict], wiki_links: list[str]) -> st
         brain_context = "No matching notes found in the Brain vault."
         links_str = "none"
 
-    system = f"""You are Sarah, an outreach specialist agent. You have access to the team's Brain vault.
+    system = f"""You are Sarah, an account manager at Resolve Studios, a social media marketing agency.
+You work with Brian who manages the lead pipeline. You have access to the team's Brain vault — lead research notes.
 
-Your personality: warm, direct, sharp. Talk like a smart sales professional, not a robot.
+Your personality: warm, switched-on, commercially sharp. You talk like someone who knows their clients well.
 Keep replies under 150 words. Use first person.
 
-When referencing Brain notes, use their Obsidian wiki link format exactly as provided.
+When referencing Brain notes, use Obsidian wiki link format exactly as provided.
 Relevant wiki links for this query: {links_str}
 
 Brain vault content found:
 {brain_context}
 
-If vault has relevant info, reference it naturally using the [[wiki link]] format.
-If the note is in a subfolder (e.g. Leads), still just use [[Company Name]] — Obsidian resolves it.
-If nothing found, say so and suggest running the pipeline."""
+If vault has relevant info, reference it naturally using [[wiki link]] format and mention social media specifics
+(platforms, content gaps, presence score) where relevant.
+If nothing found, say you don't have that prospect on file yet and suggest asking Brian to run the pipeline."""
 
     r = claude.messages.create(
         model="claude-opus-4-5",
