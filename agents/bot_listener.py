@@ -37,14 +37,6 @@ executor = ThreadPoolExecutor(max_workers=4)
 # Shared reference so Brian can look up Sarah's user ID at runtime
 sarah_user_id: int | None = None
 
-# ── Intent keywords ────────────────────────────────────────────────────────────
-
-PIPELINE_TRIGGERS = [
-    "find me a lead", "find a lead", "research a lead", "run the pipeline",
-    "run pipeline", "look into", "prospect", "find someone in", "who should we target",
-    "give me a lead", "get me a lead", "find leads in",
-]
-
 LIST_TRIGGERS = ["list", "recent leads", "what leads", "who have we", "show me leads"]
 
 
@@ -91,6 +83,29 @@ def list_recent_leads(n: int = 6) -> str:
 
 
 # ── Company picker (Brian) ─────────────────────────────────────────────────────
+
+def classify_intent(message: str) -> dict:
+    """Use Claude to classify what Brian should do with this message."""
+    r = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        system=(
+            "Classify the intent of a message sent to Brian, a pipeline manager at a social media agency. "
+            "Use find_lead for any request to find, prospect, research, chase, or identify a new lead or target — "
+            "even if phrased as a question like 'who should we go after in X'. "
+            "Use list_leads only if asking to see existing leads already in the system. "
+            "Use general for everything else. "
+            "Return valid JSON only: "
+            "{\"intent\": \"find_lead | list_leads | general\", "
+            "\"brief\": \"extracted industry/location/type brief for find_lead, else null\"}"
+        ),
+        messages=[{"role": "user", "content": message}],
+    )
+    text = r.content[0].text.strip()
+    if "```" in text:
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+    return json.loads(text.strip())
+
 
 def pick_target_company(brief: str) -> dict:
     r = claude.messages.create(
@@ -197,9 +212,6 @@ async def trigger_pipeline(company: str, website: str):
 def clean(text: str) -> str:
     return re.sub(r"<@!?\d+>", "", text).strip()
 
-def is_pipeline_request(text: str) -> bool:
-    return any(t in text.lower() for t in PIPELINE_TRIGGERS)
-
 def is_list_request(text: str) -> bool:
     return any(t in text.lower() for t in LIST_TRIGGERS)
 
@@ -260,22 +272,39 @@ class BrianBot(discord.Client):
             )
             return
 
-        # ── Trigger pipeline ───────────────────────────────────────────────────
-        if is_pipeline_request(question):
+        # ── Classify intent with Claude ────────────────────────────────────────
+        async with message.channel.typing():
+            intent_result = await asyncio.get_event_loop().run_in_executor(
+                executor, classify_intent, question
+            )
+        intent = intent_result.get("intent", "general")
+        brief  = intent_result.get("brief") or question
+
+        # ── List leads ─────────────────────────────────────────────────────────
+        if intent == "list_leads" or is_list_request(question):
+            sarah_context = await get_sarah_messages(message.channel)
+            reply = await asyncio.get_event_loop().run_in_executor(
+                executor, brian_reply, question, sarah_context
+            )
+            await message.channel.send(reply)
+            return
+
+        # ── Find / research a lead ─────────────────────────────────────────────
+        if intent == "find_lead":
             async with message.channel.typing():
                 try:
                     target = await asyncio.get_event_loop().run_in_executor(
-                        executor, pick_target_company, question
+                        executor, pick_target_company, brief
                     )
                 except Exception as e:
                     await message.channel.send(f"❌ Couldn't pick a target: {e}")
                     return
 
             await message.channel.send(
-                f"🎯 Best target for **\"{question}\"**:\n"
+                f"🎯 On it — best target I can see:\n"
                 f"> **{target['company']}** — {target.get('website', 'no website')}\n"
                 f"> {target['reason']}\n\n"
-                f"⚠️ AI-suggested — verify they exist before outreach. Kicking off now..."
+                f"⚠️ AI-suggested — verify they exist before outreach. Running the pipeline now..."
             )
             try:
                 await trigger_pipeline(target["company"], target.get("website", ""))
@@ -283,7 +312,7 @@ class BrianBot(discord.Client):
                 await message.channel.send(f"❌ Pipeline failed: {e}")
             return
 
-        # ── General question — Brian reads Sarah's recent messages for context ──
+        # ── General question ───────────────────────────────────────────────────
         async with message.channel.typing():
             sarah_context = await get_sarah_messages(message.channel)
             reply = await asyncio.get_event_loop().run_in_executor(
